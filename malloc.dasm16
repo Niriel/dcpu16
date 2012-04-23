@@ -1,0 +1,336 @@
+; Simple Memory manager for the DCPU16.
+; By Niriel, 23 april 2012.
+;
+; This code provides four subroutines to the user:
+;    - heapsetup  configures the size of the heap and frees all the heap.
+;    - heapalloc  reserves a region of the heap for the user.
+;    - heapfree   restitutes a region (reserved with heapalloc) to the heap.
+;    - heapmergefree consolidates the free regions, reducing memory
+;                    fragmentation.
+;
+
+; A memory region can be either free or reserved.
+; After calling heapsetup, the whole heap is occupied by one single free region
+; that fills it entirely.
+
+; To reserve memory, set the requested size into the X register and call
+; heapalloc.  The result is an address contained in the A register.  You can
+; safely use the X words of memory that start at the address contained in A.
+; If A equals 0, this indicates failure.  heapalloc can fail either because:
+; - there is no free region at all
+; - or there is no free region with at least X words.
+; When this happens, you may want to try consolidated free regions by calling
+; heapmergefree, and then try allocating again.  If the allocation fails a
+; second time, then you are out of memory.
+
+; To free memory, set the A register to what heapalloc gave you, and call the
+; subroutine heapfree.  Be aware that A can be modified in the process, but you
+; shouldn't keep a reference to a freed region anyway so its value doesn't mean
+; anything any more.
+
+; How does it work?
+; =================
+; The system keeps a list of the free regions.  It does not keep a list of the
+; reserved regions because that's the user's job to keep track of what he/she
+; reserves.
+
+; Each region, free or reserved, has a header zone and a data zone.
+; The header zone is one-word long.  It contains the size of the data zone.
+; The data zone of reserved regions is for the user to use the way he/she wants.
+; It is not filled with zeros or anything.  It starts at the address returned
+; by heapalloc in the register A.
+; The following is not really part of the API but may be useful: [A-1] contains
+; the size of the reserved region.  It may be a bit bigger than what the user
+; requested, we'll get to that later.  This can be useful to fill a data zone
+; with zeros for example.
+; The data zone of free regions is definitely not part of the API as it is not
+; supposed to be seen by the user.  Free regions use their data zone to store
+; the address of the next free region.  This creates a linked list that attaches
+; all the free regions together.
+
+; The first free region is contained at the address labeled :heapfirst.  It
+; MUST be located just before the beginning of the heap, which is labeled
+; :heapstart.  In other words, heapstart=heapfirst+1.
+; If there is no free region, then [heapfirst]=0xffff.
+; 0xffff marks the end of the list in general.
+
+; There is no flag indicating whether a region is free or reserved.  If it
+; belongs to the list of free regions, then it is free.  If it doesn't, then it
+; is reserved.
+
+; Memory allocation is as simple as it gets:  Start at the beginning of the list
+; of free regions, and move forward until you find a region that's big enough
+; to satisfy the user.  Cut that free regions into two: one that's the size
+; requested by the user, and one that is a free region corresponding to what's
+; left.  Because of that, regions get smaller and smaller.
+; Note that since a free region must contain at least 2 words (size, and address
+; of the next free region), the splitting does not occur if the remaining space
+; in the region would be smaller than 2.  In that case, the whole region is
+; reserved.  This means that the user can receive a region one word longer
+; than what he/she asked for.
+
+; Freeing a region does not automatically merge it with the surrounding free
+; regions.  So, you need to call heapmergefree once in a while, to consolidate
+; all the free regions.  Note that heapmergefree does NOT move the reserved
+; regions, as this would mess up the addresses of the users.  This could be
+; done, though.
+
+; A freed region is reinjected into the list.  The free regions are kept in
+; order of increasing memory address. This makes finding adjacent regions very
+; easy since we only have to look at the free region after the current one.
+; This is how consolidating the region works: if the current and the next
+; (list-wise and also memory-wise) region touch, then they can be merged.
+
+set X, 999
+jsr heapsetup
+
+set X, 5
+jsr heapalloc
+set [ptr_a], A
+
+set X, 6
+jsr heapalloc
+set [ptr_b], A
+
+set X, 7
+jsr heapalloc
+set [ptr_c], A
+
+set A, [ptr_b]
+jsr heapfree
+
+set X, 3
+jsr heapalloc
+set [ptr_b], A
+
+:crash
+    set PC, crash
+
+:ptr_a DAT 0
+:ptr_b DAT 0
+:ptr_c DAT 0
+
+
+;==========
+; heapsetup
+;==========
+; Input parameters:
+;     X: Maximum allocatable space.
+:heapsetup
+    set PUSH, A
+    ; The free blocks list points to the single free block.
+    set A, heapfirst
+    add A, 1
+    set [heapfirst], A
+    ; Allocate all the memory inside one single free block.
+    set [A], X ; Set the heap size.
+    add A, 1
+    set [A], 0xffff ; No next free block since there is only one.
+    set A, POP
+    set PC, POP
+
+
+;==========
+; heapfree
+;==========
+; Input parameters:
+;     A: the pointer to free, given by alloc.
+; Output parameters:
+;     None.
+; Note that A may be modified.  You're not planning to reuse a freed pointer
+; anyway, are you?
+:heapfree
+    ife [heapfirst], 0xffff ; Out of memory?
+        set PC, heapfree_nomem
+    ; Find where to insert the current block in the free block list.
+    set PUSH, B
+    set PUSH, C
+    ;
+    sub A, 1 ; The block begins 1 word before, with the size-word.
+    set B, 0 ; B: The free block before the current block.
+    set C, [heapfirst] ; C: The free block after the current block.
+:heapfree_loop_start
+    ifg C, A
+        set PC, heapfree_loop_end ; Found the blocks before and after A.
+    set B, C ; Keep searching, going to the next free block.
+    add C, 1 ; The second word of a free block is the address of the next
+    set C, [C] ; free block.
+    set PC, heapfree_loop_start
+:heapfree_loop_end
+    ; Make the previous free block point to the current block.
+    ife B, 0
+        set PC, heapfree_noprev ; There is no previous free block.
+    add B, 1 ; Second word is the pointer to the next block.
+    set [B], A ; Set it to the current block.
+    set PC, heapfree_noprev_end
+:heapfree_noprev
+    set [heapfirst], A ; Set the head of the free list to the current block.
+:heapfree_noprev_end
+    ; We found where to insert.
+    ; Make the current block point to the next free block.
+    add A, 1 ; Second word is the pointer to the next block.
+    set [A], C ; Works even if C is 0xffff marking 'no more blocks'.
+    ;
+    set C, POP
+    set B, POP
+    set PC, POP
+:heapfree_nomem
+    ; We're out of memory, so the block we're freeing becomes the only free
+    ; block.
+    set [A], 0xffff ; Next free block is invalid, because there is none.
+    sub A, 1
+    set heapfirst, A ; First free block is current block.
+    set PC, POP
+
+;=============
+; heapreserve
+;=============
+; Input parameters:
+;     A: the block in which to allocate.
+;     B: the previous free block.
+;        If there is no previous free block, then heapfirst-1.
+;     X: the requested size to allocate.
+:heapreserve
+    ; Y contains the free space in the block after allocation.
+    set PUSH, Y
+    set Y, [A] ; First word contains the size of the block.
+    sub Y, X ; From which we remove the requested size.
+    ifg Y, 1; Free block needs 2 words for the header.
+        set PC, heapreserve_split
+    ; There is not enough free space in the block to split, so we reserve the
+    ; full block.  That means, remove the current block from the free block
+    ; list.  To do so, make the next of the previous point to the next of the
+    ; current.
+    add B, 1 ; Next of the previous.
+    add A, 1 ; Next of the current.
+    set [B], [A] ; Make the free block list skip the current block.
+    sub A, 1 ; Restore the registers A and B.
+    sub B, 1
+    set Y, POP
+    set PC, POP
+:heapreserve_split
+    ; We split the current block in two, reserving the first part, and
+    ; making the second part free.
+    set [A], X ; Set the size of the current block.
+    ; Create the new free block.
+    set PUSH, C
+    set C, A
+    add C, X
+    add C, 1 ; Here is the beginning of the free block.
+    sub Y, 1
+    set [C], Y ; Here is its allocatable size, which excludes the size-word.
+    ; Make the previous free block point to the new free block.
+    add B, 1
+    set [B], C
+    sub B, 1
+    ; And make the new free block point to the next free block.
+    add C, 1 ; Next of the new.
+    add A, 1 ; Next of the current.
+    set [C], [A]
+    sub A, 1
+    set C, POP
+    ;
+    set Y, POP
+    set PC, POP
+
+;==========
+; heapfind
+;==========
+; Input parameters:
+;     X: the requested size to allocate.
+; Output parameters:
+;     A: the block to allocate, or 0 if can't find any.
+;     B: the free block preceeding the block to allocate, or heapfirst-1 if none.
+:heapfind
+    sub X, 1 ; Because IFG is a strict inequality.
+    set B, 0
+    set A, [heapfirst]
+:heapfind_loop
+    ife A, 0xffff ; Out of memory?
+        set PC, heapfind_nomem
+    ifg [A], X ; Block is big enough?
+        set PC, heapfind_found
+    set B, A
+    add A, 1
+    set A, [A]
+    set PC, heapfind_loop
+:heapfind_nomem
+    set A, 0 ; Never a valid address, so means "out of memory".
+:heapfind_found
+    add X, 1 ; Restore X.
+    set PC, POP
+
+;===========
+; heapalloc
+;===========
+; Input parameter:
+;     X: the requested size to allocate.
+; Output parameter:
+;     A: Pointer to the allocated block, or 0 if couldn't allocate.
+:heapalloc
+    set PUSH, B
+    jsr heapfind
+    ife A, 0 ; Out of memory.
+        set PC, heapalloc_end
+    ; Here, some trick to avoid a couple of 'if' and labels in heapreserve.
+    ; When there is no free block before the block to allocate, then we fake
+    ; one.  heapreserve wants the previous block to point to the next block,
+    ; in order to remove the allocated block from the free blocks list.
+    ; When there is no previous block, then we make reserve write to heapfirst
+    ; instead, which has the effect of making the next block the first.
+    ifn B, 0
+        set PC, heapalloc_reserve
+    set B, heapfirst
+    sub B, 1
+:heapalloc_reserve
+    jsr heapreserve
+    add A, 1 ; Give the user a handle to the data, not the header.
+:heapalloc_end
+    set B, POP
+    set PC, POP
+
+;===============
+; heapmergefree
+;===============
+:heapmergefree
+    set PUSH, A
+    set PUSH, B
+    set PUSH, C
+    set A, [heapfirst]
+    ife A, 0xffff
+        set PC, heapmergefree_end
+:heapmergefree_loop
+    ; A is the current free block.
+    ; B is the next free block.
+    ; If B is just after A, then they are merged.
+    set B, A
+    add B, 1
+    set B, [B]
+    ; C is the end of the current block.
+    set C, A ; Start at the current block.
+    add C, [A] ; Add the size of the current block.
+    add C, 1 ; Add 1 to have the beginning of the next block.
+    ife B, C ; If next free region starts just after the current ends,
+        set PC, heapmergefree_merge ; then they must be merged.
+    ; Cannot merge A more, move to the next block.
+    set A, B
+    ife A, 0xffff ; Reached the last free region?
+        set PC, heapmergefree_end ; Then we're done.
+    set PC, heapmergefree_loop
+:heapmergefree_merge
+    ; Add the sizes.
+    add [A], [B]
+    add [A], 1
+    ; Set the next of the current to the next of the next.
+    add A, 1
+    add B, 1
+    set [A], [B]
+    sub A, 1 ; Restore A, but no need to restore B.
+    set PC, heapmergefree_loop ; Maybe the new bigger A can be merged further?
+:heapmergefree_end
+    set C, POP
+    set B, POP
+    set A, POP
+    set PC, POP
+
+:heapfirst
